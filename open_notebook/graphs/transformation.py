@@ -4,13 +4,10 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-from open_notebook.ai.provision import provision_langchain_model
 from open_notebook.domain.notebook import Source
 from open_notebook.domain.transformation import DefaultPrompts, Transformation
-from open_notebook.exceptions import OpenNotebookError
+from open_notebook.graphs.utils import provision_langchain_model
 from open_notebook.utils import clean_thinking_content
-from open_notebook.utils.error_classifier import classify_error
-from open_notebook.utils.text_utils import extract_text_content
 
 
 class TransformationState(TypedDict):
@@ -26,46 +23,39 @@ async def run_transformation(state: dict, config: RunnableConfig) -> dict:
     content = state.get("input_text")
     assert source or content, "No content to transform"
     transformation: Transformation = state["transformation"]
+    if not content:
+        content = source.full_text
+    transformation_template_text = transformation.prompt
+    default_prompts: DefaultPrompts = DefaultPrompts(transformation_instructions=None)
+    if default_prompts.transformation_instructions:
+        transformation_template_text = f"{default_prompts.transformation_instructions}\n\n{transformation_template_text}"
 
-    try:
-        if not content:
-            content = source.full_text
-        transformation_template_text = transformation.prompt
-        default_prompts: DefaultPrompts = DefaultPrompts(transformation_instructions=None)
-        if default_prompts.transformation_instructions:
-            transformation_template_text = f"{default_prompts.transformation_instructions}\n\n{transformation_template_text}"
+    transformation_template_text = f"{transformation_template_text}\n\n# INPUT"
 
-        transformation_template_text = f"{transformation_template_text}\n\n# INPUT"
+    system_prompt = Prompter(template_text=transformation_template_text).render(
+        data=state
+    )
+    content_str = str(content) if content else ""
+    payload = [SystemMessage(content=system_prompt), HumanMessage(content=content_str)]
+    chain = await provision_langchain_model(
+        str(payload),
+        config.get("configurable", {}).get("model_id"),
+        "transformation",
+        max_tokens=5055,
+    )
 
-        # Prompter disabled - direct prompt construction
-        system_prompt = transformation_template_text
-        content_str = str(content) if content else ""
-        payload = [SystemMessage(content=system_prompt), HumanMessage(content=content_str)]
-        chain = await provision_langchain_model(
-            str(payload),
-            config.get("configurable", {}).get("model_id"),
-            "transformation",
-            max_tokens=32768,
-        )
-        system_prompt = transformation_template_text
+    response = await chain.ainvoke(payload)
 
-        response = await chain.ainvoke(payload)
+    # Clean thinking content from the response
+    response_content = response.content if isinstance(response.content, str) else str(response.content)
+    cleaned_content = clean_thinking_content(response_content)
 
-        # Clean thinking content from the response
-        response_content = extract_text_content(response.content)
-        cleaned_content = clean_thinking_content(response_content)
+    if source:
+        await source.add_insight(transformation.title, cleaned_content)
 
-        if source:
-            await source.add_insight(transformation.title, cleaned_content)
-
-        return {
-            "output": cleaned_content,
-        }
-    except OpenNotebookError:
-        raise
-    except Exception as e:
-        error_class, user_message = classify_error(e)
-        raise error_class(user_message) from e
+    return {
+        "output": cleaned_content,
+    }
 
 
 agent_state = StateGraph(TransformationState)
